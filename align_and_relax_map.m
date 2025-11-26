@@ -1,17 +1,17 @@
 function [F_Map, F_state, F_P] = align_and_relax_map(F_Map, F_state, F_P, target_pose, influence_radius)
 % ALIGN_AND_RELAX_MAP - CMF-GR: Collaborative Map Fusion with Graph Relaxation
 %
-% This function implements the hierarchical fusion approach:
+% This function implements the hierarchical fusion approach with TOPOLOGICAL relaxation:
 % 1. Calculates rigid transformation T between Follower and Leader poses
-% 2. Applies transformation to all nodes in the Follower map
-% 3. Applies relaxation formula to nearby nodes for smooth deformation
+% 2. Applies transformation to Follower state
+% 3. Propagates correction BACKWARD through graph topology (not spatial distance)
 %
 % Inputs:
 %   F_Map           - Follower map structure with .Nodes and .Count
 %   F_state         - Current Follower state [x; y; theta] (3x1)
 %   F_P             - Follower covariance matrix (3x3)
 %   target_pose     - Leader pose to align to [x; y; theta] (3x1)
-%   influence_radius - Radius for graph relaxation (meters)
+%   influence_radius - Radius for graph relaxation (meters, converted to hops)
 %
 % Outputs:
 %   F_Map   - Updated Follower map
@@ -24,54 +24,65 @@ dth = angdiff(F_state(3), target_pose(3));
 translation = target_pose(1:2) - F_state(1:2);
 
 % --- STEP 5: Calcola T_alignment ---
-% Rotation matrix of the correction (not used directly but kept for clarity)
-R_corr = [cos(dth), -sin(dth); sin(dth), cos(dth)];
-
 % The pivot point is the current F_state (rendezvous point)
 pivot = F_state(1:2);
 
 % --- STEP 6: Esegui CMF_Graph_Relaxation (Map_B, Map_A, T_alignment) ---
-% Instead of applying T rigidly to everything, we apply it with a weight.
-% Weight = 1 at rendezvous (current node).
-% Weight decays with distance (spatial distance).
+% TOPOLOGICAL RELAXATION (Paper Eq. 10):
+% Instead of using spatial distance, propagate correction backward through
+% the graph structure (temporal/topological order).
+% Weight decays with graph distance (hop count), not spatial distance.
+%
+% This is more robust in complex environments (e.g., U-turns, overlapping loops)
+% where nodes can be spatially close but topologically far apart.
 
 % Update Current State (Weight = 1 at rendezvous)
 F_state(3) = angdiff(0, F_state(3) + dth);
 F_state(1:2) = F_state(1:2) + translation;
 
-% Update Map Nodes with Graph Relaxation
+% Update Map Nodes with TOPOLOGICAL Graph Relaxation
 if F_Map.Count > 0
-    for i = 1:F_Map.Count
-        node_pose = F_Map.Nodes(i).pose;
+    % Convert influence_radius to topological hops
+    % Approximate: assume ~2m per node on average
+    influence_hops = ceil(influence_radius / 2.0);
+    influence_hops = min(influence_hops, F_Map.Count - 1);  % Cap at map size
 
-        % Distance from pivot (rendezvous)
-        dist = norm(node_pose(1:2) - pivot);
+    % Current node index (most recent, at rendezvous)
+    current_idx = F_Map.Count;
 
-        if dist < influence_radius
-            % Weight Function (Linear Decay)
-            % w = 1.0 at pivot, w = 0.0 at influence_radius
-            w = 1.0 - (dist / influence_radius);
-            if w < 0, w = 0; end
+    % Propagate correction BACKWARD through graph topology
+    for hop = 1:influence_hops
+        % Index of node to correct (going backward in time)
+        idx = current_idx - hop;
 
-            % Apply Weighted Correction
-            % 1. Rotate around pivot by w * dth
-            dth_w = w * dth;
-            R_w = [cos(dth_w), -sin(dth_w); sin(dth_w), cos(dth_w)];
-
-            rel_pos = node_pose(1:2) - pivot;
-            rot_pos = R_w * rel_pos;
-
-            % 2. Translate by w * translation
-            trans_w = w * translation;
-
-            new_pos = pivot + rot_pos + trans_w;
-            new_th = angdiff(0, node_pose(3) + dth_w);
-
-            F_Map.Nodes(i).pose = [new_pos; new_th];
+        if idx < 1
+            break;  % Reached beginning of map
         end
+
+        node_pose = F_Map.Nodes(idx).pose;
+
+        % Weight Function: Linear decay with TOPOLOGICAL distance (hop count)
+        % w = 1.0 at rendezvous (hop=0), w = 0.0 at influence_hops
+        w = 1.0 - (hop / influence_hops);
+
+        % Apply Weighted Correction
+        % 1. Rotate around pivot by w * dth
+        dth_w = w * dth;
+        R_w = [cos(dth_w), -sin(dth_w); sin(dth_w), cos(dth_w)];
+
+        rel_pos = node_pose(1:2) - pivot;
+        rot_pos = R_w * rel_pos;
+
+        % 2. Translate by w * translation
+        trans_w = w * translation;
+
+        new_pos = pivot + rot_pos + trans_w;
+        new_th = angdiff(0, node_pose(3) + dth_w);
+
+        F_Map.Nodes(idx).pose = [new_pos; new_th];
     end
 
-    % Update last_node_pose if it was modified
+    % Update last_node_pose (most recent node)
     F_Map.last_node_pose = F_Map.Nodes(F_Map.Count).pose;
 end
 
