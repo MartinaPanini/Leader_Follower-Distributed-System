@@ -1,0 +1,34 @@
+================================================
+  KITTI Sequence 09 - Results
+================================================
+
+Simulation Time: 33.10 seconds
+
+1. ACCURACY - RMSE Position (x,y)
+   ----------------------------------------
+   Leader (UKF vs GT):        51.412 m
+   Follower Odometry:         21.388 m
+   Follower UKF Only:         47.395 m
+   Follower UKF + CMF:        5.576 m
+   UKF vs Odometry:           -121.6% better
+
+2. CONSISTENCY - NEES
+   ----------------------------------------
+   Mean NEES:                 1626.14 ± 4555.31
+   Expected (2-DOF):          ~2.00
+   Chi-squared 95% bound:     < 5.99
+
+3. FUSION - ATE (Absolute Trajectory Error)
+   ----------------------------------------
+   ATE Before Fusion:         26.201 m
+   ATE After CMF-GR:          3.722 m
+   Improvement:               85.8%
+
+4. NETWORK - Data Payload
+   ----------------------------------------
+   Num. Corrections:          454
+   Total Data Exchanged:      42.56 KB
+
+================================================
+OVERALL IMPROVEMENT: 73.9%
+================================================
