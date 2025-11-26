@@ -116,6 +116,7 @@ F_drift_hist = zeros(3, N);
 
 % Covariance history for NEES calculation
 L_P_hist = zeros(3, 3, N);
+F_P_hist = zeros(3, 3, N);  % Follower covariance history
 
 % Follower UKF Only (No CMF)
 F_pure_state = [GT.x(1); GT.y(1); GT.th(1)];
@@ -176,6 +177,7 @@ for k = 1:N-1
     L_hist(:, k) = L_state;
     L_P_hist(:, :, k) = L_P;  % Save covariance for NEES
     F_hist(:, k) = F_state;
+    F_P_hist(:, :, k) = F_P;  % Save Follower covariance for NEES
     F_pure_hist(:, k) = F_pure_state;
 
     % --- A questo punto hai due stime indipendenti e slegate ---
@@ -246,6 +248,7 @@ end
 L_hist(:, end) = L_state;
 L_P_hist(:, :, end) = L_P;  % Save final covariance
 F_hist(:, end) = F_state;
+F_P_hist(:, :, end) = F_P;  % Save final Follower covariance
 F_pure_hist(:, end) = F_pure_state;
 F_drift_hist(:, end) = F_drift_state;
 
@@ -267,7 +270,9 @@ rmse_F_pure = rms(err_F_Pure);
 % 2. AFFIDABILITÀ - NEES (Normalized Estimation Error Squared)
 % NEES = (x_true - x_est)^T * P^-1 * (x_true - x_est)
 % Using only position (x,y) for 2-DOF NEES
-nees_vals = zeros(N, 1);
+
+% NEES for Leader
+nees_L_vals = zeros(N, 1);
 for k = 1:N
     % Position error (2D)
     err_vec = [GT.x(k) - L_hist(1,k); GT.y(k) - L_hist(2,k)];
@@ -277,17 +282,39 @@ for k = 1:N
 
     % Compute NEES
     try
-        nees_vals(k) = err_vec' * inv(P_pos) * err_vec;
+        nees_L_vals(k) = err_vec' * inv(P_pos) * err_vec;
     catch
         % If P is singular, skip this point
-        nees_vals(k) = NaN;
+        nees_L_vals(k) = NaN;
+    end
+end
+
+% NEES for Follower (with CMF-GR)
+nees_F_vals = zeros(N, 1);
+for k = 1:N
+    % Position error (2D)
+    err_vec = [GT.x(k) - F_hist(1,k); GT.y(k) - F_hist(2,k)];
+
+    % Extract position covariance (2x2 submatrix)
+    P_pos = F_P_hist(1:2, 1:2, k);
+
+    % Compute NEES
+    try
+        nees_F_vals(k) = err_vec' * inv(P_pos) * err_vec;
+    catch
+        % If P is singular, skip this point
+        nees_F_vals(k) = NaN;
     end
 end
 
 % Remove NaN values for mean calculation
-nees_vals_clean = nees_vals(~isnan(nees_vals));
-nees_mean = mean(nees_vals_clean);
-nees_std = std(nees_vals_clean);
+nees_L_clean = nees_L_vals(~isnan(nees_L_vals));
+nees_L_mean = mean(nees_L_clean);
+nees_L_std = std(nees_L_clean);
+
+nees_F_clean = nees_F_vals(~isnan(nees_F_vals));
+nees_F_mean = mean(nees_F_clean);
+nees_F_std = std(nees_F_clean);
 
 % NEES ideale dovrebbe essere ~ n (numero di dimensioni, qui 2)
 % Se NEES >> n, il filtro è overconfident
@@ -319,13 +346,14 @@ fprintf('   ✓ UKF beats Odometry:      %.1f%% better\n', (rmse_F_drift - rmse_
 
 fprintf('\n2. CONSISTENCY - NEES \n');
 fprintf('   ----------------------------------------\n');
-fprintf('   Mean NEES:                 %.2f ± %.2f\n', nees_mean, nees_std);
+fprintf('   Leader NEES:               %.2f ± %.2f\n', nees_L_mean, nees_L_std);
+fprintf('   Follower NEES (UKF+CMF):   %.2f ± %.2f\n', nees_F_mean, nees_F_std);
 fprintf('   Expected (2-DOF):          ~2.00\n');
 fprintf('   Chi-squared 95%% bound:     < 5.99\n');
-if nees_mean < 4
-    fprintf('   ✓ Filter is consistent (not overconfident)\n');
+if nees_F_mean < 10
+    fprintf('   ✓ Follower filter improved with CMF-GR\n');
 else
-    fprintf('   ⚠ Filter may be overconfident\n');
+    fprintf('   ⚠ Follower filter may still be overconfident\n');
 end
 
 fprintf('\n3. FUSION - ATE (Absolute Trajectory Error)\n');

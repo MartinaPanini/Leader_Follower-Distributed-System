@@ -75,9 +75,51 @@ if F_Map.Count > 0
     F_Map.last_node_pose = F_Map.Nodes(F_Map.Count).pose;
 end
 
-% Update Covariance
-% Reduce uncertainty as we have fused with Leader
-F_P = F_P * 0.5;
+% Update Covariance using Covariance Intersection
+% This method handles unknown correlations between Leader and Follower
+% Reference: DRP_Notes.pdf Cap. 15 - Distributed Data Fusion
+%
+% The old method (F_P = F_P * 0.5) was mathematically invalid:
+% - Artificially reduced uncertainty
+% - Caused filter inconsistency (NEES >> expected value)
+% - Violated uncertainty propagation principles
+%
+% Covariance Intersection provides conservative, consistent fusion:
+
+% Mixing parameter (0 < omega < 1)
+% omega closer to 1 = trust Follower more
+% omega closer to 0 = trust Leader more
+% omega = 0.5 = equal weighting (conservative)
+omega = 0.5;
+
+% Estimate of Leader's uncertainty at rendezvous
+% This should ideally be received from Leader, but we approximate it
+% based on typical UKF performance
+P_Leader_est = diag([5^2, 5^2, 0.1^2]);  % [x_var, y_var, theta_var]
+
+% Covariance Intersection formula:
+% P_fused^-1 = omega * P_Follower^-1 + (1 - omega) * P_Leader^-1
+try
+    P_F_inv = inv(F_P);
+    P_L_inv = inv(P_Leader_est);
+    P_fused_inv = omega * P_F_inv + (1 - omega) * P_L_inv;
+    F_P = inv(P_fused_inv);
+catch
+    % If inversion fails (singular matrix), fall back to addition
+    warning('Covariance inversion failed, using conservative addition');
+    F_P = F_P + P_Leader_est;
+end
+
+% Add uncertainty from visual matching/sequence matching
+% This represents the imperfect nature of the rendezvous detection
+R_match = diag([2^2, 2^2, 0.05^2]);  % Matching uncertainty
+F_P = F_P + R_match;
+
+% Ensure symmetry and positive definiteness
+F_P = (F_P + F_P') / 2;
+[U, S] = eig(F_P);
+S = max(S, 1e-6);  % Ensure positive eigenvalues
+F_P = U * S * U';
 
 end
 
