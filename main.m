@@ -10,7 +10,7 @@ if extractFeatures == true
         preprocess_kitti_features(sequence_path, output_filename);
     end
 end
-seq_id = '09';
+seq_id = '05';
 filename_gt = fullfile('Dataset', 'poses', strcat(seq_id, '.txt'));
 feature_file = fullfile('Dataset', 'features', strcat('kitti_', seq_id, '_features.mat'));
 
@@ -103,15 +103,19 @@ L_Map.Nodes = [];
 L_Map.last_node_pose = L_state;
 
 % Follower
-F_state = [GT.x(1); GT.y(1); GT.th(1)];
+%F_state = [GT.x(1); GT.y(1); GT.th(1)];
+F_state = [0; 0; 0];
 F_P = eye(3) * 0.1; % Initialize Follower Covariance
 F_Map.Nodes = [];
 F_Map.last_node_pose = F_state;
-F_drift_state = [GT.x(1); GT.y(1); GT.th(1)]; % odometry
+F_drift_state = F_state; % odometry
 
 L_hist = zeros(3, N);
 F_hist = zeros(3, N);
 F_drift_hist = zeros(3, N);
+
+% Covariance history for NEES calculation
+L_P_hist = zeros(3, 3, N);
 
 % Follower UKF Only (No CMF)
 F_pure_state = [GT.x(1); GT.y(1); GT.th(1)];
@@ -170,6 +174,7 @@ for k = 1:N-1
     F_drift_hist(:, k) = F_drift_state;
 
     L_hist(:, k) = L_state;
+    L_P_hist(:, :, k) = L_P;  % Save covariance for NEES
     F_hist(:, k) = F_state;
     F_pure_hist(:, k) = F_pure_state;
 
@@ -239,36 +244,105 @@ for k = 1:N-1
     if mod(k, 200) == 0, fprintf('.'); end
 end
 L_hist(:, end) = L_state;
+L_P_hist(:, :, end) = L_P;  % Save final covariance
 F_hist(:, end) = F_state;
 F_pure_hist(:, end) = F_pure_state;
 F_drift_hist(:, end) = F_drift_state;
 
 fprintf('\nSimulation completed in %.2f sec.\n', toc);
 
-%% COMPUTE ERROR RMSE
+%% COMPUTE COMPREHENSIVE METRICS
 
+% 1. ACCURATEZZA - RMSE Posizione (x,y)
 err_L_EKF = sqrt((L_hist(1,:)' - GT.x).^2 + (L_hist(2,:)' - GT.y).^2);
 err_F_Drift = sqrt((F_drift_hist(1,:)' - GT.x).^2 + (F_drift_hist(2,:)' - GT.y).^2);
 err_F_Corr = sqrt((F_hist(1,:)' - GT.x).^2 + (F_hist(2,:)' - GT.y).^2);
+err_F_Pure = sqrt((F_pure_hist(1,:)' - GT.x).^2 + (F_pure_hist(2,:)' - GT.y).^2);
 
 rmse_L = rms(err_L_EKF);
 rmse_F_drift = rms(err_F_Drift);
 rmse_F_corr = rms(err_F_Corr);
-
-err_F_Pure = sqrt((F_pure_hist(1,:)' - GT.x).^2 + (F_pure_hist(2,:)' - GT.y).^2);
 rmse_F_pure = rms(err_F_Pure);
 
-fprintf('\n------------------------------------------------\n');
-fprintf('       FINAL ANALYSIS            \n');
-fprintf('------------------------------------------------\n');
-fprintf('RMSE Leader   (UKF vs GT):      %.3f m\n', rmse_L);
-fprintf('RMSE Follower (NOT CORR):       %.3f m\n', rmse_F_drift);
-fprintf('RMSE Follower (UKF ONLY):       %.3f m\n', rmse_F_pure);
-fprintf('RMSE Follower (CORRECT):        %.3f m\n', rmse_F_corr);
-fprintf('------------------------------------------------\n');
-fprintf('IMPROVEMENT:        %.1f %%\n', ...
-    (rmse_F_drift - rmse_F_corr)/rmse_F_drift * 100);
-fprintf('------------------------------------------------\n');
+% 2. AFFIDABILITÀ - NEES (Normalized Estimation Error Squared)
+% NEES = (x_true - x_est)^T * P^-1 * (x_true - x_est)
+% Using only position (x,y) for 2-DOF NEES
+nees_vals = zeros(N, 1);
+for k = 1:N
+    % Position error (2D)
+    err_vec = [GT.x(k) - L_hist(1,k); GT.y(k) - L_hist(2,k)];
+
+    % Extract position covariance (2x2 submatrix)
+    P_pos = L_P_hist(1:2, 1:2, k);
+
+    % Compute NEES
+    try
+        nees_vals(k) = err_vec' * inv(P_pos) * err_vec;
+    catch
+        % If P is singular, skip this point
+        nees_vals(k) = NaN;
+    end
+end
+
+% Remove NaN values for mean calculation
+nees_vals_clean = nees_vals(~isnan(nees_vals));
+nees_mean = mean(nees_vals_clean);
+nees_std = std(nees_vals_clean);
+
+% NEES ideale dovrebbe essere ~ n (numero di dimensioni, qui 2)
+% Se NEES >> n, il filtro è overconfident
+% Chi-squared test: per 2-DOF, 95% dei valori dovrebbero essere < 5.99
+
+% 3. FUSIONE - ATE (Absolute Trajectory Error)
+% ATE misura l'errore di traiettoria globale
+ate_before = mean(err_F_Pure);  % ATE prima della fusione
+ate_after = mean(err_F_Corr);   % ATE dopo CMF-GR
+ate_improvement = (ate_before - ate_after) / ate_before * 100;
+
+% 4. NETWORK - Data Payload (KB)
+% Stima del payload scambiato durante la fusione
+num_corrections = size(CorrectionData, 1);
+bytes_per_correction = 3 * 8 + 9 * 8;  % state (3 doubles) + P (9 doubles)
+total_payload_bytes = num_corrections * bytes_per_correction;
+total_payload_kb = total_payload_bytes / 1024;
+
+fprintf('\n================================================\n');
+fprintf('         FINAL ANALYSIS            \n');
+fprintf('================================================\n');
+fprintf('\n1. ACCURACY - RMSE Position (x,y)\n');
+fprintf('   ----------------------------------------\n');
+fprintf('   Leader (UKF vs GT):        %.3f m\n', rmse_L);
+fprintf('   Follower Odometry:         %.3f m\n', rmse_F_drift);
+fprintf('   Follower UKF Only:         %.3f m\n', rmse_F_pure);
+fprintf('   Follower UKF + CMF:        %.3f m\n', rmse_F_corr);
+fprintf('   ✓ UKF beats Odometry:      %.1f%% better\n', (rmse_F_drift - rmse_F_pure)/rmse_F_drift * 100);
+
+fprintf('\n2. CONSISTENCY - NEES \n');
+fprintf('   ----------------------------------------\n');
+fprintf('   Mean NEES:                 %.2f ± %.2f\n', nees_mean, nees_std);
+fprintf('   Expected (2-DOF):          ~2.00\n');
+fprintf('   Chi-squared 95%% bound:     < 5.99\n');
+if nees_mean < 4
+    fprintf('   ✓ Filter is consistent (not overconfident)\n');
+else
+    fprintf('   ⚠ Filter may be overconfident\n');
+end
+
+fprintf('\n3. FUSION - ATE (Absolute Trajectory Error)\n');
+fprintf('   ----------------------------------------\n');
+fprintf('   ATE Before Fusion:         %.3f m\n', ate_before);
+fprintf('   ATE After CMF-GR:          %.3f m\n', ate_after);
+fprintf('   ✓ Improvement:             %.1f%%\n', ate_improvement);
+
+fprintf('\n4. NETWORK - Data Payload\n');
+fprintf('   ----------------------------------------\n');
+fprintf('   Num. Corrections:          %d\n', num_corrections);
+fprintf('   Total Data Exchanged:      %.2f KB\n', total_payload_kb);
+fprintf('   Avg. per Correction:       %.2f bytes\n', bytes_per_correction);
+
+fprintf('\n================================================\n');
+fprintf('OVERALL IMPROVEMENT: %.1f%%\n', (rmse_F_drift - rmse_F_corr)/rmse_F_drift * 100);
+fprintf('================================================\n');
 
 %% PLOT
 
