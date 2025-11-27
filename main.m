@@ -18,9 +18,9 @@ feature_file = fullfile('Dataset', 'features', strcat('kitti_', seq_id, '_featur
 
 % Simulation
 dt = 0.1;
-Param.sigma_v = 0.2;
-Param.sigma_w = 0.05;
-Param.rand_seed = 42;
+Param.sigma_v = 0.01; % Reduced noise (Proprioceptive sensors)
+Param.sigma_w = 0.002;
+Param.rand_seed = 100;
 
 % Map & Matching
 MapParams.dist_thresh = 2.0;
@@ -38,7 +38,7 @@ UkfParams.sigma_rot_odom   = 0.002;
 UkfParams.sigma_range      = 0.1;
 UkfParams.sigma_bearing    = 0.01;
 UkfParams.max_sensor_range = 350;
-UkfParams.Q = diag([0.02^2, 0.01^2]);
+UkfParams.Q = diag([0.01^2, 0.005^2]); % Reduced Q to prevent P explosion
 UkfParams.R = diag([UkfParams.sigma_range^2, UkfParams.sigma_bearing^2]);
 
 % UKF Weights
@@ -88,9 +88,6 @@ end
 
 min_x = min(GT.x); max_x = max(GT.x);
 min_y = min(GT.y); max_y = max(GT.y);
-offset = 50;
-Landmarks = [min_x-offset, min_y-offset; max_x+offset, min_y-offset;
-    max_x+offset, max_y+offset; min_x-offset, max_y+offset];
 
 %% INIZIALIZATION
 
@@ -139,6 +136,7 @@ for r = 1:N_ROBOTS
 end
 
 CorrectionData = [];
+LoopClosureStats = zeros(N_ROBOTS, 1);
 
 rng(Param.rand_seed);
 
@@ -195,7 +193,7 @@ for k = 1:N_STEPS-1
         % In this simulation, we simulate landmarks based on the robot's TRUE position at seq_idx+1
         true_pose_next = [GT.x(seq_idx+1); GT.y(seq_idx+1); GT.th(seq_idx+1)];
 
-        [Robots(r).state, Robots(r).P] = ukf(Robots(r).state, Robots(r).P, v_r, w_r, true_pose_next, Landmarks, UkfParams);
+        [Robots(r).state, Robots(r).P] = ukf(Robots(r).state, Robots(r).P, v_r, w_r, UkfParams);
 
         % 3. Map Management
         [Robots(r).Map, node_added] = update_map_rt(Robots(r).Map, Robots(r).state, seq_idx, MapParams, Robots(r).name);
@@ -236,7 +234,9 @@ for k = 1:N_STEPS-1
 
                 % Filter by distance threshold
                 [vals, sorted_idxs] = sort(dists);
-                candidates = sorted_idxs(vals < 15.0); % 15m radius
+                % INCREASED RADIUS: 15m -> 500m to handle large drift (Dead Reckoning)
+                % This allows the robot to find candidates even if its estimated position is far off.
+                candidates = sorted_idxs(vals < 100.0);
 
                 % Self-Check Constraint: Exclude recent nodes to avoid trivial matches
                 if r == j
@@ -311,6 +311,8 @@ for k = 1:N_STEPS-1
                     % Store for Visualization
                     CorrectionData = [CorrectionData;
                         Robots(r).state(1), Robots(r).state(2), target_pose(1), target_pose(2)];
+
+                    LoopClosureStats(r) = LoopClosureStats(r) + 1;
                 end
             end
         end
@@ -378,7 +380,8 @@ for r = 1:N_ROBOTS
     fprintf('\nROBOT %d (%s):\n', Robots(r).id, Robots(r).name);
     fprintf('   RMSE Position:       %.3f m\n', rmse);
     fprintf('   NEES (Avg ± Std):    %.2f ± %.2f\n', nees_mean, nees_std);
-
+    fprintf('   Loop Closures:       %d\n', LoopClosureStats(r));
+    %
     if nees_mean < 5.99
         fprintf('   ✓ Filter Consistent (NEES < 5.99)\n');
     else
@@ -396,7 +399,6 @@ title('Distributed Multi-Robot System');
 
 % Plot Ground Truth
 plot(GT.x, GT.y, 'Color', [0.8 0.8 0.8], 'LineWidth', 4, 'DisplayName', 'Ground Truth');
-plot(Landmarks(:,1), Landmarks(:,2), 'ks', 'MarkerFaceColor', 'y', 'MarkerSize', 8, 'DisplayName', 'Landmarks');
 
 for r = 1:N_ROBOTS
     % Plot Trajectory
