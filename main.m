@@ -116,7 +116,9 @@ F_drift_hist = zeros(3, N);
 
 % Covariance history for NEES calculation
 L_P_hist = zeros(3, 3, N);
+L_NEES_hist = zeros(1, N);
 F_P_hist = zeros(3, 3, N);  % Follower covariance history
+F_NEES_hist = zeros(1, N);
 
 % Follower UKF Only (No CMF)
 F_pure_state = [GT.x(1); GT.y(1); GT.th(1)];
@@ -150,6 +152,10 @@ for k = 1:N-1
     % Il Leader stima dove si trova basandosi SOLO sui SUOI sensori
     true_pose_k1 = [GT.x(k+1); GT.y(k+1); GT.th(k+1)];
     [L_state, L_P] = run_local_ukf(L_state, L_P, v_cmd, w_cmd, true_pose_k1, Landmarks, UkfParams);
+    e_k = [GT.x(k+1); GT.y(k+1); GT.th(k+1)] - L_state;
+    e_k(3) = angdiff(L_state(3), GT.th(k+1));
+    nees_k = e_k' * inv(L_P) * e_k;
+    L_NEES_hist(k) = nees_k;
     [L_Map, L_node_added] = update_map_rt(L_Map, L_state, current_view_id, MapParams);
 
     % 2. Aggiornamento Locale FOLLOWER
@@ -163,6 +169,11 @@ for k = 1:N-1
     % 2. Aggiornamento Locale FOLLOWER (run_local_ukf)
     % Il Follower stima dove si trova basandosi SOLO sui SUOI sensori
     [F_state, F_P] = run_local_ukf(F_state, F_P, v_F, w_F, true_pose_k1, Landmarks, UkfParams);
+    % Compute NEES for follower
+    e_f = [GT.x(k+1); GT.y(k+1); GT.th(k+1)] - F_state;
+    e_f(3) = angdiff(F_state(3), GT.th(k+1));
+    nees_f = e_f' * inv(F_P) * e_f;
+    F_NEES_hist(k) = nees_f;
     [F_Map, F_node_added] = update_map_rt(F_Map, F_state, current_view_id, MapParams);
 
     % UKF for Follower (Pure - No CMF)
@@ -422,7 +433,7 @@ plot(GT.x, GT.y, 'Color', [0.9 0.9 0.9], 'LineWidth', 2, 'DisplayName', 'Ground 
 % Plot all nodes colored by source
 for i = 1:Global_Map.Count
     node = Global_Map.Nodes(i);
-    
+
     if strcmp(node.source, 'Leader')
         % Leader nodes in blue
         plot(node.pose(1), node.pose(2), 'bo', 'MarkerSize', 6, ...
@@ -444,17 +455,17 @@ plot(nan, nan, 'ro', 'MarkerSize', 8, 'MarkerFaceColor', 'r', 'DisplayName', ...
 if ~isempty(Global_Map.Edges)
     for i = 1:length(Global_Map.Edges)
         edge = Global_Map.Edges(i);
-        
+
         % Find the Follower node position
         f_idx = edge.from_original_id;
         if f_idx <= F_Map.Count
             f_pos = F_Map.Nodes(f_idx).pose(1:2);
-            
+
             % Find the Leader node position
             l_idx = edge.to_global_id;
             if l_idx <= L_Map.Count
                 l_pos = L_Map.Nodes(l_idx).pose(1:2);
-                
+
                 % Draw link
                 if i == 1
                     plot([f_pos(1), l_pos(1)], [f_pos(2), l_pos(2)], 'g-', ...
@@ -463,7 +474,7 @@ if ~isempty(Global_Map.Edges)
                     plot([f_pos(1), l_pos(1)], [f_pos(2), l_pos(2)], 'g-', ...
                         'LineWidth', 2, 'HandleVisibility', 'off');
                 end
-                
+
                 % Mark rendezvous points
                 plot(f_pos(1), f_pos(2), 'go', 'MarkerSize', 10, 'LineWidth', 2, 'HandleVisibility', 'off');
             end
@@ -487,6 +498,16 @@ stats_text = sprintf(['Global Map Statistics:\n' ...
 annotation('textbox', [0.15, 0.75, 0.2, 0.15], 'String', stats_text, ...
     'FitBoxToText', 'on', 'BackgroundColor', 'white', ...
     'EdgeColor', 'black', 'FontSize', 10);
+
+% Plot 4: NEES over time
+figure('Name', 'NEES over Time', 'Color', 'w', 'Position', [50, 750, 900, 400]);
+hold on; grid on;
+plot(1:N, L_NEES_hist, 'b-', 'LineWidth', 1.5, 'DisplayName', 'Leader NEES');
+plot(1:N, F_NEES_hist, 'r-', 'LineWidth', 1.5, 'DisplayName', 'Follower NEES');
+xlabel('Step k');
+ylabel('NEES');
+title('NEES Evolution');
+legend('Location', 'best');
 
 
 function [Map, added] = update_map_rt(Map, pose, view_id, Params)

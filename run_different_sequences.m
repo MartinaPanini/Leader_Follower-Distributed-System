@@ -10,7 +10,7 @@
 clear; clc; close all;
 
 %% CONFIGURATION
-LEADER_SEQ = '09';    % Leader's trajectory
+LEADER_SEQ = '02';    % Leader's trajectory
 FOLLOWER_SEQ = '05';  % Follower's trajectory
 
 % For visualization - offset follower start position to avoid overlap
