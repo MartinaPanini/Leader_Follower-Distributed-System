@@ -173,7 +173,7 @@ for k = 1:N-1
     current_view_id = k;
 
     true_pose_k1 = [GT.x(k+1); GT.y(k+1); GT.th(k+1)];
-    [L_state, L_P] = run_local_ukf(L_state, L_P, v_cmd, w_cmd, true_pose_k1, Landmarks, UkfParams);
+    [L_state, L_P] = ukf(L_state, L_P, v_cmd, w_cmd, true_pose_k1, Landmarks, UkfParams);
     [L_Map, L_node_added] = update_map_rt(L_Map, L_state, current_view_id, MapParams);
 
     noise_v = randn * Param.sigma_v * dt;
@@ -181,10 +181,10 @@ for k = 1:N-1
     v_F = v_cmd + noise_v;
     w_F = w_cmd + noise_w;
 
-    [F_state, F_P] = run_local_ukf(F_state, F_P, v_F, w_F, true_pose_k1, Landmarks, UkfParams);
+    [F_state, F_P] = ukf(F_state, F_P, v_F, w_F, true_pose_k1, Landmarks, UkfParams);
     [F_Map, F_node_added] = update_map_rt(F_Map, F_state, current_view_id, MapParams);
 
-    [F_pure_state, F_pure_P] = run_local_ukf(F_pure_state, F_pure_P, v_F, w_F, true_pose_k1, Landmarks, UkfParams);
+    [F_pure_state, F_pure_P] = ukf(F_pure_state, F_pure_P, v_F, w_F, true_pose_k1, Landmarks, UkfParams);
 
     F_drift_state(1) = F_drift_state(1) + v_F * cos(F_drift_state(3));
     F_drift_state(2) = F_drift_state(2) + v_F * sin(F_drift_state(3));

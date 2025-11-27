@@ -1,4 +1,4 @@
-function [F_Map, F_state, F_P] = align_and_relax_map(F_Map, F_state, F_P, target_pose, influence_radius)
+function [F_Map, F_state, F_P] = align_and_relax_map(F_Map, F_state, F_P, target_pose, influence_radius, L_P)
 % ALIGN_AND_RELAX_MAP - CMF-GR: Collaborative Map Fusion with Graph Relaxation
 %
 % This function implements the hierarchical fusion approach with TOPOLOGICAL relaxation:
@@ -12,6 +12,7 @@ function [F_Map, F_state, F_P] = align_and_relax_map(F_Map, F_state, F_P, target
 %   F_P             - Follower covariance matrix (3x3)
 %   target_pose     - Leader pose to align to [x; y; theta] (3x1)
 %   influence_radius - Radius for graph relaxation (meters, converted to hops)
+%   L_P             - Leader covariance matrix (3x3)
 %
 % Outputs:
 %   F_Map   - Updated Follower map
@@ -106,19 +107,19 @@ omega = 0.5;
 % Estimate of Leader's uncertainty at rendezvous
 % This should ideally be received from Leader, but we approximate it
 % based on typical UKF performance
-P_Leader_est = diag([5^2, 5^2, 0.1^2]);  % [x_var, y_var, theta_var]
+%P_Leader_est = diag([5^2, 5^2, 0.1^2]);  % [x_var, y_var, theta_var]
 
 % Covariance Intersection formula:
 % P_fused^-1 = omega * P_Follower^-1 + (1 - omega) * P_Leader^-1
 try
     P_F_inv = inv(F_P);
-    P_L_inv = inv(P_Leader_est);
+    P_L_inv = inv(L_P);
     P_fused_inv = omega * P_F_inv + (1 - omega) * P_L_inv;
     F_P = inv(P_fused_inv);
 catch
     % If inversion fails (singular matrix), fall back to addition
     warning('Covariance inversion failed, using conservative addition');
-    F_P = F_P + P_Leader_est;
+    F_P = F_P + L_P;
 end
 
 % Add uncertainty from visual matching/sequence matching

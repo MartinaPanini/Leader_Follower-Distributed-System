@@ -148,10 +148,10 @@ for k = 1:N-1
     w_cmd = dth_true;
     current_view_id = k;
 
-    % 1. Aggiornamento Locale LEADER (run_local_ukf)
+    % 1. Aggiornamento Locale LEADER ()
     % Il Leader stima dove si trova basandosi SOLO sui SUOI sensori
     true_pose_k1 = [GT.x(k+1); GT.y(k+1); GT.th(k+1)];
-    [L_state, L_P] = run_local_ukf(L_state, L_P, v_cmd, w_cmd, true_pose_k1, Landmarks, UkfParams);
+    [L_state, L_P] = ukf(L_state, L_P, v_cmd, w_cmd, true_pose_k1, Landmarks, UkfParams);
     e_k = [GT.x(k+1); GT.y(k+1); GT.th(k+1)] - L_state;
     e_k(3) = angdiff(L_state(3), GT.th(k+1));
     nees_k = e_k' * inv(L_P) * e_k;
@@ -166,9 +166,9 @@ for k = 1:N-1
     v_F = v_cmd + noise_v;
     w_F = w_cmd + noise_w;
 
-    % 2. Aggiornamento Locale FOLLOWER (run_local_ukf)
+    % 2. Aggiornamento Locale FOLLOWER (ukf)
     % Il Follower stima dove si trova basandosi SOLO sui SUOI sensori
-    [F_state, F_P] = run_local_ukf(F_state, F_P, v_F, w_F, true_pose_k1, Landmarks, UkfParams);
+    [F_state, F_P] = ukf(F_state, F_P, v_F, w_F, true_pose_k1, Landmarks, UkfParams);
     % Compute NEES for follower
     e_f = [GT.x(k+1); GT.y(k+1); GT.th(k+1)] - F_state;
     e_f(3) = angdiff(F_state(3), GT.th(k+1));
@@ -177,7 +177,7 @@ for k = 1:N-1
     [F_Map, F_node_added] = update_map_rt(F_Map, F_state, current_view_id, MapParams);
 
     % UKF for Follower (Pure - No CMF)
-    [F_pure_state, F_pure_P] = run_local_ukf(F_pure_state, F_pure_P, v_F, w_F, true_pose_k1, Landmarks, UkfParams);
+    [F_pure_state, F_pure_P] = ukf(F_pure_state, F_pure_P, v_F, w_F, true_pose_k1, Landmarks, UkfParams);
 
     % Pure Odometry for comparison (Drift)
     F_drift_state(1) = F_drift_state(1) + v_F * cos(F_drift_state(3));
@@ -551,7 +551,7 @@ if dth_check < MAX_ANGLE_ERR && dist_check < MAX_DIST_JUMP
     influence_radius = 50.0;
 
     % Call align_and_relax_map to perform CMF-GR
-    [F_Map, F_state, F_P] = align_and_relax_map(F_Map, F_state, F_P, target_pose, influence_radius);
+    [F_Map, F_state, F_P] = align_and_relax_map(F_Map, F_state, F_P, target_pose, influence_radius, L_P);
 
     % Record Correction
     CorrectionData = [CorrectionData; pivot(1), pivot(2), target_pose(1), target_pose(2)];

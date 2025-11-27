@@ -1,5 +1,5 @@
-function [x_next, P_next] = run_local_ukf(x, P, v, w, true_pose, Landmarks, Params)
-% RUN_LOCAL_UKF - Unscented Kalman Filter for robot localization
+function [x_next, P_next] = ukf(x, P, v, w, true_pose, Landmarks, Params)
+% UKF - Unscented Kalman Filter for robot localization
 %
 % Implements UKF with Unscented Transform for prediction and update steps.
 % This function performs one complete prediction + update cycle.
