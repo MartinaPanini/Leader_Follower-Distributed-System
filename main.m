@@ -1,49 +1,45 @@
 clear; clc; close all;
 
-%% EXCTRACT FEATURES
+%% FEATURE EXTRACTION (Optional)
 extractFeatures = false;
 POSES = {'00', '01', '02', '03', '04', '05', '06', '07', '08', '09'};
-if extractFeatures == true
+if extractFeatures
     for i = 1:length(POSES)
         sequence_path = fullfile('Dataset', 'sequences', POSES{i}, 'image_0');
         output_filename = strcat('kitti_', POSES{i}, '_features.mat');
         preprocess_kitti_features(sequence_path, output_filename);
     end
 end
+
 seq_id = '00';
 filename_gt = fullfile('Dataset', 'poses', strcat(seq_id, '.txt'));
 feature_file = fullfile('Dataset', 'features', strcat('kitti_', seq_id, '_features.mat'));
 
-%% GLOBAL CONFIGURATION
+%% PARAMETERS
 
-% Simulation
 dt = 0.1;
-Param.sigma_v = 0.01; % Reduced noise (Proprioceptive sensors)
+Param.sigma_v = 0.01;
 Param.sigma_w = 0.002;
 Param.rand_seed = 100;
 
-% Map & Matching
 MapParams.dist_thresh = 2.0;
 MapParams.angle_thresh = deg2rad(20);
 SeqParams.seq_len = 10;
 SeqParams.match_thresh = 0.10;
 Correction.gain = 0.8;
-% Security tresholds
 MAX_ANGLE_ERR = deg2rad(30);
 MAX_DIST_JUMP = 8.0;
 
-% UKF Leader
 UkfParams.sigma_scale_odom = 0.05;
 UkfParams.sigma_rot_odom   = 0.002;
 UkfParams.sigma_range      = 0.1;
 UkfParams.sigma_bearing    = 0.01;
 UkfParams.max_sensor_range = 350;
-UkfParams.Q = diag([0.01^2, 0.005^2]); % Reduced Q to prevent P explosion
+UkfParams.Q = diag([0.01^2, 0.005^2]);
 UkfParams.R = diag([UkfParams.sigma_range^2, UkfParams.sigma_bearing^2]);
 
-% UKF Weights
 n = 3;
-alpha = 1.0; % Increased from 1e-3 to 1.0 to avoid negative weights and improve stability
+alpha = 1.0;
 beta = 2;
 kappa = 0;
 lambda = alpha^2 * (n + kappa) - n;
@@ -61,10 +57,10 @@ UkfParams.Wc(2:end) = 1 / (2 * (n + lambda));
 %% LOAD DATA
 
 if ~isfile(filename_gt)
-    error('File pose dont found: %s', filename_gt);
+    error('Ground truth file not found: %s', filename_gt);
 end
 
-fprintf('Load data\n');
+fprintf('Loading data...\n');
 raw_data = load(filename_gt);
 GT.x = raw_data(:, 12);
 GT.y = raw_data(:, 4);
@@ -81,7 +77,7 @@ if isfile(feature_file)
     AllFeatures = feat_data.AllFeatures;
     use_visual_features = true;
 else
-    warning('File features dont found. Geometric Fallback.');
+    warning('Features not found. Using geometric fallback.');
     use_visual_features = false;
     AllFeatures = [];
 end
@@ -89,20 +85,17 @@ end
 min_x = min(GT.x); max_x = max(GT.x);
 min_y = min(GT.y); max_y = max(GT.y);
 
-%% INIZIALIZATION
+%% INITIALIZATION
 
 N_STEPS = length(GT.x);
-
-% Robot Configuration
 N_ROBOTS = 2;
 Robots = repmat(struct, N_ROBOTS, 1);
 
-% Robot 1 (Leader)
 Robots(1).id = 1;
 Robots(1).name = 'Leader';
 Robots(1).color = 'b';
 Robots(1).start_delay = 0;
-Robots(1).sigma_v = 0.0; % Perfect odometry for Leader (as in original)
+Robots(1).sigma_v = 0.0;
 Robots(1).sigma_w = 0.0;
 Robots(1).state = [GT.x(1); GT.y(1); GT.th(1)];
 Robots(1).P = eye(3) * 0.1;
@@ -113,14 +106,13 @@ Robots(1).hist.state = zeros(3, N_STEPS);
 Robots(1).hist.P = zeros(3, 3, N_STEPS);
 Robots(1).hist.nees = nan(1, N_STEPS);
 
-% Robot 2 (Follower)
 Robots(2).id = 2;
 Robots(2).name = 'Follower';
 Robots(2).color = 'r';
-Robots(2).start_delay = 200; % Time-Delayed Deployment
+Robots(2).start_delay = 200;
 Robots(2).sigma_v = Param.sigma_v;
 Robots(2).sigma_w = Param.sigma_w;
-Robots(2).state = [0; 0; 0]; % Will be initialized when it starts
+Robots(2).state = [0; 0; 0];
 Robots(2).P = eye(3) * 0.1;
 Robots(2).Map.Nodes = [];
 Robots(2).Map.Count = 0;
@@ -129,7 +121,6 @@ Robots(2).hist.state = zeros(3, N_STEPS);
 Robots(2).hist.P = zeros(3, 3, N_STEPS);
 Robots(2).hist.nees = nan(1, N_STEPS);
 
-% Pre-allocate Map Nodes for performance
 EmptyNode = struct('id', 0, 'pose', [0;0;0], 'view_id', 0, 'source', '');
 for r = 1:N_ROBOTS
     Robots(r).Map.Nodes = repmat(EmptyNode, N_STEPS, 1);
@@ -137,7 +128,6 @@ end
 
 CorrectionData = [];
 LoopClosureStats = zeros(N_ROBOTS, 1);
-
 rng(Param.rand_seed);
 
 %% SIMULATION LOOP
@@ -146,34 +136,21 @@ fprintf('\nSTART SIMULATION (%d steps) <<<\n', N_STEPS);
 tic;
 
 for k = 1:N_STEPS-1
-
-    % Global Ground Truth at step k (for reference/environment)
-
     for r = 1:N_ROBOTS
-        % Calculate robot's local time / sequence index
         seq_idx = k - Robots(r).start_delay;
 
         if seq_idx < 1
-            % Robot has not started yet
             continue;
         elseif seq_idx == 1
-            % Initialization step for this robot
-            % Set initial state to the start of the path (GT index 1)
             Robots(r).state = [GT.x(1); GT.y(1); GT.th(1)];
             Robots(r).Map.last_node_pose = Robots(r).state;
-
-            % Save initial history
             Robots(r).hist.state(:, k) = Robots(r).state;
             Robots(r).hist.P(:, :, k) = Robots(r).P;
             continue;
         elseif seq_idx >= N_STEPS
-            % Robot has finished the path
             continue;
         end
 
-        % --- Robot is Active ---
-
-        % 1. Get Control Inputs (Odometry) from Dataset at seq_idx
         dx = GT.x(seq_idx+1) - GT.x(seq_idx);
         dy = GT.y(seq_idx+1) - GT.y(seq_idx);
         dth_true = angdiff(GT.th(seq_idx), GT.th(seq_idx+1));
@@ -181,27 +158,20 @@ for k = 1:N_STEPS-1
         v_cmd = sqrt(dx^2 + dy^2);
         w_cmd = dth_true;
 
-        % Add Noise
         noise_v = randn * Robots(r).sigma_v * dt;
         noise_w = randn * Robots(r).sigma_w * dt;
 
         v_r = v_cmd + noise_v;
         w_r = w_cmd + noise_w;
 
-        % 2. Prediction (UKF)
-        % We need the "True Pose" at k+1 for the measurement update (GPS/Landmarks simulation)
-        % In this simulation, we simulate landmarks based on the robot's TRUE position at seq_idx+1
         true_pose_next = [GT.x(seq_idx+1); GT.y(seq_idx+1); GT.th(seq_idx+1)];
 
         [Robots(r).state, Robots(r).P] = ukf(Robots(r).state, Robots(r).P, v_r, w_r, UkfParams);
 
-        % 3. Map Management
         [Robots(r).Map, node_added] = update_map_rt(Robots(r).Map, Robots(r).state, seq_idx, MapParams, Robots(r).name);
 
-        % 4. Compute NEES (vs Ground Truth at seq_idx+1)
         e_k = true_pose_next - Robots(r).state;
         e_k(3) = angdiff(Robots(r).state(3), true_pose_next(3));
-        % 2D NEES
         try
             nees_k = e_k(1:2)' * inv(Robots(r).P(1:2,1:2)) * e_k(1:2);
             Robots(r).hist.nees(k) = nees_k;
@@ -209,19 +179,14 @@ for k = 1:N_STEPS-1
             Robots(r).hist.nees(k) = NaN;
         end
 
-        % 5. Save History
         Robots(r).hist.state(:, k) = Robots(r).state;
         Robots(r).hist.P(:, :, k) = Robots(r).P;
 
-        % 6. Perception & Loop Closure ("Trust No One")
-        % Check against ALL maps (including self)
-
         if node_added
             for j = 1:N_ROBOTS
-                % Skip if map is empty
                 if Robots(j).Map.Count == 0, continue; end
 
-                % Candidate Selection: Find nodes in Map j close to Robot r
+
                 % Optimization: In a real system, use spatial hashing or KD-tree.
                 % Here: Brute force distance check (acceptable for N < 10000)
 
@@ -330,29 +295,12 @@ fprintf('         FINAL ANALYSIS            \n');
 fprintf('================================================\n');
 
 for r = 1:N_ROBOTS
-    % 1. RMSE Calculation
-    % Compare Robot state history vs Ground Truth
-    % Note: Robot history is aligned to Global Step k.
-    % But Robot is only active when k > start_delay.
 
     valid_mask = Robots(r).hist.state(1,:) ~= 0;
 
     % Extract estimated path
     est_x = Robots(r).hist.state(1, valid_mask)';
     est_y = Robots(r).hist.state(2, valid_mask)';
-
-    % Extract corresponding GT path
-    % GT is indexed by k.
-    % BUT, does Robot state at k correspond to GT at k?
-    % Yes, in our loop:
-    % seq_idx = k - delay
-    % true_pose_next = GT(seq_idx+1)
-    % Robots(r).state is updated to estimate true_pose_next.
-    % So Robots(r).state at step k estimates GT at seq_idx+1.
-    % Let's verify indices.
-    % At step k, we compute state for k.
-    % It estimates GT(seq_idx+1).
-    % So we should compare Robots(r).hist.state(:, k) with GT(seq_idx+1).
 
     indices = find(valid_mask);
     gt_indices = indices - Robots(r).start_delay + 1;
@@ -452,9 +400,6 @@ d = b - a; d = mod(d + pi, 2*pi) - pi;
 end
 
 function [F_Map, F_state, F_P, CorrectionData] = execute_CMF_GR(F_Map, L_Map, F_state, x_L, F_P, L_P, CorrectionData, Correction, MAX_ANGLE_ERR, MAX_DIST_JUMP)
-% CMF_GR: Collaborative Map Fusion / Global Registration
-% Uses Leader state (x_L) to correct Follower state (F_state) and Map.
-% Implements Rigid Alignment + Graph Relaxation via align_and_relax_map.
 
 target_pose = x_L;
 
