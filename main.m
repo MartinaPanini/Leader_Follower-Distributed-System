@@ -10,7 +10,7 @@ if extractFeatures == true
         preprocess_kitti_features(sequence_path, output_filename);
     end
 end
-seq_id = '05';
+seq_id = '00';
 filename_gt = fullfile('Dataset', 'poses', strcat(seq_id, '.txt'));
 feature_file = fullfile('Dataset', 'features', strcat('kitti_', seq_id, '_features.mat'));
 
@@ -37,8 +37,8 @@ UkfParams.sigma_scale_odom = 0.05;
 UkfParams.sigma_rot_odom   = 0.002;
 UkfParams.sigma_range      = 0.1;
 UkfParams.sigma_bearing    = 0.01;
-UkfParams.max_sensor_range = 250;
-UkfParams.Q = diag([0.05^2, 0.01^2]);
+UkfParams.max_sensor_range = 350;
+UkfParams.Q = diag([0.02^2, 0.01^2]);
 UkfParams.R = diag([UkfParams.sigma_range^2, UkfParams.sigma_bearing^2]);
 
 % UKF Weights
@@ -94,36 +94,49 @@ Landmarks = [min_x-offset, min_y-offset; max_x+offset, min_y-offset;
 
 %% INIZIALIZATION
 
-N = length(GT.x);
+N_STEPS = length(GT.x);
 
-% Leader
-L_state = [GT.x(1); GT.y(1); GT.th(1)];
-L_P = eye(3) * 0.1;
-L_Map.Nodes = [];
-L_Map.last_node_pose = L_state;
+% Robot Configuration
+N_ROBOTS = 2;
+Robots = repmat(struct, N_ROBOTS, 1);
 
-% Follower
-%F_state = [GT.x(1); GT.y(1); GT.th(1)];
-F_state = [0; 0; 0];
-F_P = eye(3) * 0.1; % Initialize Follower Covariance
-F_Map.Nodes = [];
-F_Map.last_node_pose = F_state;
-F_drift_state = F_state; % odometry
+% Robot 1 (Leader)
+Robots(1).id = 1;
+Robots(1).name = 'Leader';
+Robots(1).color = 'b';
+Robots(1).start_delay = 0;
+Robots(1).sigma_v = 0.0; % Perfect odometry for Leader (as in original)
+Robots(1).sigma_w = 0.0;
+Robots(1).state = [GT.x(1); GT.y(1); GT.th(1)];
+Robots(1).P = eye(3) * 0.1;
+Robots(1).Map.Nodes = [];
+Robots(1).Map.Count = 0;
+Robots(1).Map.last_node_pose = Robots(1).state;
+Robots(1).hist.state = zeros(3, N_STEPS);
+Robots(1).hist.P = zeros(3, 3, N_STEPS);
+Robots(1).hist.nees = nan(1, N_STEPS);
 
-L_hist = zeros(3, N);
-F_hist = zeros(3, N);
-F_drift_hist = zeros(3, N);
+% Robot 2 (Follower)
+Robots(2).id = 2;
+Robots(2).name = 'Follower';
+Robots(2).color = 'r';
+Robots(2).start_delay = 200; % Time-Delayed Deployment
+Robots(2).sigma_v = Param.sigma_v;
+Robots(2).sigma_w = Param.sigma_w;
+Robots(2).state = [0; 0; 0]; % Will be initialized when it starts
+Robots(2).P = eye(3) * 0.1;
+Robots(2).Map.Nodes = [];
+Robots(2).Map.Count = 0;
+Robots(2).Map.last_node_pose = Robots(2).state;
+Robots(2).hist.state = zeros(3, N_STEPS);
+Robots(2).hist.P = zeros(3, 3, N_STEPS);
+Robots(2).hist.nees = nan(1, N_STEPS);
 
-% Covariance history for NEES calculation
-L_P_hist = zeros(3, 3, N);
-L_NEES_hist = zeros(1, N);
-F_P_hist = zeros(3, 3, N);  % Follower covariance history
-F_NEES_hist = zeros(1, N);
-
-% Follower UKF Only (No CMF)
-F_pure_state = [GT.x(1); GT.y(1); GT.th(1)];
-F_pure_P = eye(3) * 0.1;
-F_pure_hist = zeros(3, N);
+% Pre-allocate Map Nodes for performance
+EmptyNode = struct('id', 0, 'pose', [0;0;0], 'view_id', 0, 'source', '');
+for r = 1:N_ROBOTS
+    Robots(r).Map.Nodes = repmat(EmptyNode, N_STEPS, 1);
+end
 
 CorrectionData = [];
 
@@ -131,397 +144,304 @@ rng(Param.rand_seed);
 
 %% SIMULATION LOOP
 
-fprintf('\nSTART SIMULATION (%d steps) <<<\n', N);
+fprintf('\nSTART SIMULATION (%d steps) <<<\n', N_STEPS);
 tic;
 
-EmptyNode = struct('id', 0, 'pose', [0;0;0], 'view_id', 0);
-L_Map.Nodes = repmat(EmptyNode, N, 1); L_Map.Count = 0;
-F_Map.Nodes = repmat(EmptyNode, N, 1); F_Map.Count = 0;
+for k = 1:N_STEPS-1
 
-for k = 1:N-1
+    % Global Ground Truth at step k (for reference/environment)
 
-    % input
-    dx = GT.x(k+1) - GT.x(k);
-    dy = GT.y(k+1) - GT.y(k);
-    dth_true = angdiff(GT.th(k), GT.th(k+1));
-    v_cmd = sqrt(dx^2 + dy^2);
-    w_cmd = dth_true;
-    current_view_id = k;
+    for r = 1:N_ROBOTS
+        % Calculate robot's local time / sequence index
+        seq_idx = k - Robots(r).start_delay;
 
-    % 1. Aggiornamento Locale LEADER ()
-    % Il Leader stima dove si trova basandosi SOLO sui SUOI sensori
-    true_pose_k1 = [GT.x(k+1); GT.y(k+1); GT.th(k+1)];
-    [L_state, L_P] = ukf(L_state, L_P, v_cmd, w_cmd, true_pose_k1, Landmarks, UkfParams);
-    e_k = [GT.x(k+1); GT.y(k+1); GT.th(k+1)] - L_state;
-    e_k(3) = angdiff(L_state(3), GT.th(k+1));
-    nees_k = e_k' * inv(L_P) * e_k;
-    L_NEES_hist(k) = nees_k;
-    [L_Map, L_node_added] = update_map_rt(L_Map, L_state, current_view_id, MapParams);
+        if seq_idx < 1
+            % Robot has not started yet
+            continue;
+        elseif seq_idx == 1
+            % Initialization step for this robot
+            % Set initial state to the start of the path (GT index 1)
+            Robots(r).state = [GT.x(1); GT.y(1); GT.th(1)];
+            Robots(r).Map.last_node_pose = Robots(r).state;
 
-    % 2. Aggiornamento Locale FOLLOWER
-    % Il Follower stima dove si trova basandosi SOLO sui SUOI sensori
-    % Generate noisy control for Follower
-    noise_v = randn * Param.sigma_v * dt;
-    noise_w = randn * Param.sigma_w * dt;
-    v_F = v_cmd + noise_v;
-    w_F = w_cmd + noise_w;
-
-    % 2. Aggiornamento Locale FOLLOWER (ukf)
-    % Il Follower stima dove si trova basandosi SOLO sui SUOI sensori
-    [F_state, F_P] = ukf(F_state, F_P, v_F, w_F, true_pose_k1, Landmarks, UkfParams);
-    % Compute NEES for follower
-    e_f = [GT.x(k+1); GT.y(k+1); GT.th(k+1)] - F_state;
-    e_f(3) = angdiff(F_state(3), GT.th(k+1));
-    nees_f = e_f' * inv(F_P) * e_f;
-    F_NEES_hist(k) = nees_f;
-    [F_Map, F_node_added] = update_map_rt(F_Map, F_state, current_view_id, MapParams);
-
-    % UKF for Follower (Pure - No CMF)
-    [F_pure_state, F_pure_P] = ukf(F_pure_state, F_pure_P, v_F, w_F, true_pose_k1, Landmarks, UkfParams);
-
-    % Pure Odometry for comparison (Drift)
-    F_drift_state(1) = F_drift_state(1) + v_F * cos(F_drift_state(3));
-    F_drift_state(2) = F_drift_state(2) + v_F * sin(F_drift_state(3));
-    F_drift_state(3) = F_drift_state(3) + w_F;
-    F_drift_hist(:, k) = F_drift_state;
-
-    L_hist(:, k) = L_state;
-    L_P_hist(:, :, k) = L_P;  % Save covariance for NEES
-    F_hist(:, k) = F_state;
-    F_P_hist(:, :, k) = F_P;  % Save Follower covariance for NEES
-    F_pure_hist(:, k) = F_pure_state;
-
-    % --- A questo punto hai due stime indipendenti e slegate ---
-
-    % 3. Controllo Sequence Matching (Brain-Inspired)
-    % Check if we can match Follower current view with Leader Map
-    is_match = false;
-    best_L_idx = -1;
-
-    if F_node_added && L_Map.Count > 0
-        valid_L_nodes = L_Map.Nodes(1:L_Map.Count);
-        Ln_coords = reshape([valid_L_nodes.pose], 3, [])';
-        dists = sqrt((Ln_coords(:,1) - F_state(1)).^2 + (Ln_coords(:,2) - F_state(2)).^2);
-
-        [vals, sorted_idxs] = sort(dists);
-        valid_mask = vals < 15.0;
-        candidate_indices = sorted_idxs(valid_mask);
-        if length(candidate_indices) > 3, candidate_indices = candidate_indices(1:3); end
-
-        best_score = 0;
-
-        for i = 1:length(candidate_indices)
-            idx_L = candidate_indices(i);
-            cand_view_id = L_Map.Nodes(idx_L).view_id;
-
-            if use_visual_features
-                [match_bool, score] = perform_sequence_matching(...
-                    current_view_id, cand_view_id, AllFeatures, AllFeatures, SeqParams);
-            else
-                match_bool = abs(current_view_id - cand_view_id) < 5; score = 1.0;
-            end
-
-            if match_bool && score > best_score
-                best_score = score; best_L_idx = idx_L;
-            end
+            % Save initial history
+            Robots(r).hist.state(:, k) = Robots(r).state;
+            Robots(r).hist.P(:, :, k) = Robots(r).P;
+            continue;
+        elseif seq_idx >= N_STEPS
+            % Robot has finished the path
+            continue;
         end
 
-        if best_L_idx > 0
-            is_match = true;
+        % --- Robot is Active ---
+
+        % 1. Get Control Inputs (Odometry) from Dataset at seq_idx
+        dx = GT.x(seq_idx+1) - GT.x(seq_idx);
+        dy = GT.y(seq_idx+1) - GT.y(seq_idx);
+        dth_true = angdiff(GT.th(seq_idx), GT.th(seq_idx+1));
+
+        v_cmd = sqrt(dx^2 + dy^2);
+        w_cmd = dth_true;
+
+        % Add Noise
+        noise_v = randn * Robots(r).sigma_v * dt;
+        noise_w = randn * Robots(r).sigma_w * dt;
+
+        v_r = v_cmd + noise_v;
+        w_r = w_cmd + noise_w;
+
+        % 2. Prediction (UKF)
+        % We need the "True Pose" at k+1 for the measurement update (GPS/Landmarks simulation)
+        % In this simulation, we simulate landmarks based on the robot's TRUE position at seq_idx+1
+        true_pose_next = [GT.x(seq_idx+1); GT.y(seq_idx+1); GT.th(seq_idx+1)];
+
+        [Robots(r).state, Robots(r).P] = ukf(Robots(r).state, Robots(r).P, v_r, w_r, true_pose_next, Landmarks, UkfParams);
+
+        % 3. Map Management
+        [Robots(r).Map, node_added] = update_map_rt(Robots(r).Map, Robots(r).state, seq_idx, MapParams, Robots(r).name);
+
+        % 4. Compute NEES (vs Ground Truth at seq_idx+1)
+        e_k = true_pose_next - Robots(r).state;
+        e_k(3) = angdiff(Robots(r).state(3), true_pose_next(3));
+        % 2D NEES
+        try
+            nees_k = e_k(1:2)' * inv(Robots(r).P(1:2,1:2)) * e_k(1:2);
+            Robots(r).hist.nees(k) = nees_k;
+        catch
+            Robots(r).hist.nees(k) = NaN;
+        end
+
+        % 5. Save History
+        Robots(r).hist.state(:, k) = Robots(r).state;
+        Robots(r).hist.P(:, :, k) = Robots(r).P;
+
+        % 6. Perception & Loop Closure ("Trust No One")
+        % Check against ALL maps (including self)
+
+        if node_added
+            for j = 1:N_ROBOTS
+                % Skip if map is empty
+                if Robots(j).Map.Count == 0, continue; end
+
+                % Candidate Selection: Find nodes in Map j close to Robot r
+                % Optimization: In a real system, use spatial hashing or KD-tree.
+                % Here: Brute force distance check (acceptable for N < 10000)
+
+                valid_nodes = Robots(j).Map.Nodes(1:Robots(j).Map.Count);
+                poses_j = [valid_nodes.pose];
+
+                % Calculate distances to current robot state
+                dists = sqrt((poses_j(1,:) - Robots(r).state(1)).^2 + ...
+                    (poses_j(2,:) - Robots(r).state(2)).^2);
+
+                % Filter by distance threshold
+                [vals, sorted_idxs] = sort(dists);
+                candidates = sorted_idxs(vals < 15.0); % 15m radius
+
+                % Self-Check Constraint: Exclude recent nodes to avoid trivial matches
+                if r == j
+                    % Exclude last 200 nodes/frames
+                    recent_cutoff = Robots(r).Map.Count - 200;
+                    candidates = candidates(candidates < recent_cutoff);
+                end
+
+                % Limit candidates to top 3
+                if length(candidates) > 3, candidates = candidates(1:3); end
+
+                best_score = 0;
+                best_node_idx = -1;
+
+                for c_idx = 1:length(candidates)
+                    idx_map_j = candidates(c_idx);
+                    cand_node = Robots(j).Map.Nodes(idx_map_j);
+
+                    % Sequence Matching
+                    if use_visual_features
+                        [is_match, score] = perform_sequence_matching(...
+                            seq_idx, cand_node.view_id, AllFeatures, AllFeatures, SeqParams);
+                    else
+                        % Geometric fallback (if no features)
+                        % For simulation without features, we assume match if close enough
+                        % But strictly, we should check view_id difference for self-check
+                        if r == j && abs(seq_idx - cand_node.view_id) < 50
+                            is_match = false; score = 0;
+                        else
+                            is_match = true; score = 1.0;
+                        end
+                    end
+
+                    if is_match && score > best_score
+                        best_score = score;
+                        best_node_idx = idx_map_j;
+                    end
+                end
+
+                % Rendezvous Event
+                if best_node_idx > 0
+
+                    target_pose = Robots(j).Map.Nodes(best_node_idx).pose;
+
+                    % Retrieve Target Covariance (P)
+                    % We need P associated with the target node.
+                    % Since we store P history by step k, we need the step k corresponding to the node.
+                    % Robots(j).Map.Nodes(idx).view_id stores the sequence index (local time).
+                    % But Robots(j).hist.P is indexed by Global Step k.
+                    % We need to map view_id back to global k?
+                    % Actually, Robots(j).hist.P is indexed by k (1..N_STEPS).
+                    % And view_id was set to seq_idx (local time).
+                    % Wait, seq_idx = k - delay.
+                    % So global_k = view_id + delay.
+
+                    target_view_id = Robots(j).Map.Nodes(best_node_idx).view_id;
+                    target_global_k = target_view_id + Robots(j).start_delay;
+
+                    if target_global_k > 0 && target_global_k <= N_STEPS
+                        target_P = Robots(j).hist.P(:, :, target_global_k);
+                    else
+                        % Fallback if history not available (should not happen for valid nodes)
+                        target_P = eye(3) * 0.1;
+                    end
+
+                    % Execute CMF-GR (Map Fusion)
+                    % Influence Radius: 50 meters
+                    [Robots(r).Map, Robots(r).state, Robots(r).P] = align_and_relax_map(...
+                        Robots(r).Map, Robots(r).state, Robots(r).P, ...
+                        target_pose, 50.0, target_P);
+
+                    % Store for Visualization
+                    CorrectionData = [CorrectionData;
+                        Robots(r).state(1), Robots(r).state(2), target_pose(1), target_pose(2)];
+                end
+            end
         end
     end
-
-    if is_match
-        % 4. Evento "Rendezvous": FUSIONE
-        % Qui usi x_L e P_L (calcolati con UKF) per correggere la mappa del Follower
-
-        % Retrieve Leader Node info for fusion
-        target_pose = L_Map.Nodes(best_L_idx).pose;
-        % Note: In a real distributed system, we would receive x_L and P_L associated with that node.
-        % Here we use the current L_state if it's live, or the stored pose.
-        % The pseudocode says "x_L, P_L". Let's assume we use the stored node pose as x_L.
-        % And we need P_L. We didn't store P in Map.Nodes.
-        % For simplicity, let's use the current P_L (approx) or a fixed covariance.
-        % Or better, let's pass the current L_state and L_P if we assume they are meeting NOW.
-        % But Sequence Matching matches against PAST nodes.
-        % So strictly, we should have stored P in the map.
-        % Let's use L_P (current) as a proxy or just pass it as requested.
-
-        % To strictly follow pseudocode signature:
-        % Map_F = execute_CMF_GR(Map_F, Map_L, x_F, x_L, P_F, P_L);
-        % We need to update F_state too.
-
-        [F_Map, F_state, F_P, CorrectionData] = execute_CMF_GR(F_Map, L_Map, F_state, target_pose, F_P, L_P, CorrectionData, Correction, MAX_ANGLE_ERR, MAX_DIST_JUMP);
+    if mod(k, 200) == 0
+        fprintf('.');
     end
-
-    if mod(k, 200) == 0, fprintf('.'); end
 end
-L_hist(:, end) = L_state;
-L_P_hist(:, :, end) = L_P;  % Save final covariance
-F_hist(:, end) = F_state;
-F_P_hist(:, :, end) = F_P;  % Save final Follower covariance
-F_pure_hist(:, end) = F_pure_state;
-F_drift_hist(:, end) = F_drift_state;
 
 fprintf('\nSimulation completed in %.2f sec.\n', toc);
 
-%% COMPUTE COMPREHENSIVE METRICS
-
-% 1. ACCURATEZZA - RMSE Posizione (x,y)
-err_L_EKF = sqrt((L_hist(1,:)' - GT.x).^2 + (L_hist(2,:)' - GT.y).^2);
-err_F_Drift = sqrt((F_drift_hist(1,:)' - GT.x).^2 + (F_drift_hist(2,:)' - GT.y).^2);
-err_F_Corr = sqrt((F_hist(1,:)' - GT.x).^2 + (F_hist(2,:)' - GT.y).^2);
-err_F_Pure = sqrt((F_pure_hist(1,:)' - GT.x).^2 + (F_pure_hist(2,:)' - GT.y).^2);
-
-rmse_L = rms(err_L_EKF);
-rmse_F_drift = rms(err_F_Drift);
-rmse_F_corr = rms(err_F_Corr);
-rmse_F_pure = rms(err_F_Pure);
-
-% 2. AFFIDABILITÀ - NEES (Normalized Estimation Error Squared)
-% NEES = (x_true - x_est)^T * P^-1 * (x_true - x_est)
-% Using only position (x,y) for 2-DOF NEES
-
-% NEES for Leader
-nees_L_vals = zeros(N, 1);
-for k = 1:N
-    % Position error (2D)
-    err_vec = [GT.x(k) - L_hist(1,k); GT.y(k) - L_hist(2,k)];
-
-    % Extract position covariance (2x2 submatrix)
-    P_pos = L_P_hist(1:2, 1:2, k);
-
-    % Compute NEES
-    try
-        nees_L_vals(k) = err_vec' * inv(P_pos) * err_vec;
-    catch
-        % If P is singular, skip this point
-        nees_L_vals(k) = NaN;
-    end
-end
-
-% NEES for Follower (with CMF-GR)
-nees_F_vals = zeros(N, 1);
-for k = 1:N
-    % Position error (2D)
-    err_vec = [GT.x(k) - F_hist(1,k); GT.y(k) - F_hist(2,k)];
-
-    % Extract position covariance (2x2 submatrix)
-    P_pos = F_P_hist(1:2, 1:2, k);
-
-    % Compute NEES
-    try
-        nees_F_vals(k) = err_vec' * inv(P_pos) * err_vec;
-    catch
-        % If P is singular, skip this point
-        nees_F_vals(k) = NaN;
-    end
-end
-
-% Remove NaN values for mean calculation
-nees_L_clean = nees_L_vals(~isnan(nees_L_vals));
-nees_L_mean = mean(nees_L_clean);
-nees_L_std = std(nees_L_clean);
-
-nees_F_clean = nees_F_vals(~isnan(nees_F_vals));
-nees_F_mean = mean(nees_F_clean);
-nees_F_std = std(nees_F_clean);
-
-% NEES ideale dovrebbe essere ~ n (numero di dimensioni, qui 2)
-% Se NEES >> n, il filtro è overconfident
-% Chi-squared test: per 2-DOF, 95% dei valori dovrebbero essere < 5.99
-
-% 3. FUSIONE - ATE (Absolute Trajectory Error)
-% ATE misura l'errore di traiettoria globale
-ate_before = mean(err_F_Pure);  % ATE prima della fusione
-ate_after = mean(err_F_Corr);   % ATE dopo CMF-GR
-ate_improvement = (ate_before - ate_after) / ate_before * 100;
-
-% 4. NETWORK - Data Payload (KB)
-% Stima del payload scambiato durante la fusione
-num_corrections = size(CorrectionData, 1);
-bytes_per_correction = 3 * 8 + 9 * 8;  % state (3 doubles) + P (9 doubles)
-total_payload_bytes = num_corrections * bytes_per_correction;
-total_payload_kb = total_payload_bytes / 1024;
-
+%% COMPUTE METRICS
 fprintf('\n================================================\n');
 fprintf('         FINAL ANALYSIS            \n');
 fprintf('================================================\n');
-fprintf('\n1. ACCURACY - RMSE Position (x,y)\n');
-fprintf('   ----------------------------------------\n');
-fprintf('   Leader (UKF vs GT):        %.3f m\n', rmse_L);
-fprintf('   Follower Odometry:         %.3f m\n', rmse_F_drift);
-fprintf('   Follower UKF Only:         %.3f m\n', rmse_F_pure);
-fprintf('   Follower UKF + CMF:        %.3f m\n', rmse_F_corr);
-fprintf('   ✓ UKF beats Odometry:      %.1f%% better\n', (rmse_F_drift - rmse_F_pure)/rmse_F_drift * 100);
 
-fprintf('\n2. CONSISTENCY - NEES \n');
-fprintf('   ----------------------------------------\n');
-fprintf('   Leader NEES:               %.2f ± %.2f\n', nees_L_mean, nees_L_std);
-fprintf('   Follower NEES (UKF+CMF):   %.2f ± %.2f\n', nees_F_mean, nees_F_std);
-fprintf('   Expected (2-DOF):          ~2.00\n');
-fprintf('   Chi-squared 95%% bound:     < 5.99\n');
-if nees_F_mean < 10
-    fprintf('   ✓ Follower filter improved with CMF-GR\n');
-else
-    fprintf('   ⚠ Follower filter may still be overconfident\n');
+for r = 1:N_ROBOTS
+    % 1. RMSE Calculation
+    % Compare Robot state history vs Ground Truth
+    % Note: Robot history is aligned to Global Step k.
+    % But Robot is only active when k > start_delay.
+
+    valid_mask = Robots(r).hist.state(1,:) ~= 0;
+
+    % Extract estimated path
+    est_x = Robots(r).hist.state(1, valid_mask)';
+    est_y = Robots(r).hist.state(2, valid_mask)';
+
+    % Extract corresponding GT path
+    % GT is indexed by k.
+    % BUT, does Robot state at k correspond to GT at k?
+    % Yes, in our loop:
+    % seq_idx = k - delay
+    % true_pose_next = GT(seq_idx+1)
+    % Robots(r).state is updated to estimate true_pose_next.
+    % So Robots(r).state at step k estimates GT at seq_idx+1.
+    % Let's verify indices.
+    % At step k, we compute state for k.
+    % It estimates GT(seq_idx+1).
+    % So we should compare Robots(r).hist.state(:, k) with GT(seq_idx+1).
+
+    indices = find(valid_mask);
+    gt_indices = indices - Robots(r).start_delay + 1;
+
+    % Filter out-of-bounds GT indices (just in case)
+    valid_gt = gt_indices <= length(GT.x) & gt_indices > 0;
+    indices = indices(valid_gt);
+    gt_indices = gt_indices(valid_gt);
+
+    est_x = Robots(r).hist.state(1, indices)';
+    est_y = Robots(r).hist.state(2, indices)';
+
+    gt_x = GT.x(gt_indices);
+    gt_y = GT.y(gt_indices);
+
+    err_dist = sqrt((est_x - gt_x).^2 + (est_y - gt_y).^2);
+    rmse = rms(err_dist);
+
+    % 2. NEES Calculation
+    % Already computed in loop: Robots(r).hist.nees(k)
+    nees_vals = Robots(r).hist.nees(indices);
+    nees_mean = mean(nees_vals, 'omitnan');
+    nees_std = std(nees_vals, 'omitnan');
+
+    fprintf('\nROBOT %d (%s):\n', Robots(r).id, Robots(r).name);
+    fprintf('   RMSE Position:       %.3f m\n', rmse);
+    fprintf('   NEES (Avg ± Std):    %.2f ± %.2f\n', nees_mean, nees_std);
+
+    if nees_mean < 5.99
+        fprintf('   ✓ Filter Consistent (NEES < 5.99)\n');
+    else
+        fprintf('   ⚠ Filter Inconsistent/Overconfident\n');
+    end
 end
-
-fprintf('\n3. FUSION - ATE (Absolute Trajectory Error)\n');
-fprintf('   ----------------------------------------\n');
-fprintf('   ATE Before Fusion:         %.3f m\n', ate_before);
-fprintf('   ATE After CMF-GR:          %.3f m\n', ate_after);
-fprintf('   ✓ Improvement:             %.1f%%\n', ate_improvement);
-
-fprintf('\n4. NETWORK - Data Payload\n');
-fprintf('   ----------------------------------------\n');
-fprintf('   Num. Corrections:          %d\n', num_corrections);
-fprintf('   Total Data Exchanged:      %.2f KB\n', total_payload_kb);
-fprintf('   Avg. per Correction:       %.2f bytes\n', bytes_per_correction);
-
-fprintf('\n================================================\n');
-fprintf('OVERALL IMPROVEMENT: %.1f%%\n', (rmse_F_drift - rmse_F_corr)/rmse_F_drift * 100);
 fprintf('================================================\n');
 
-%% CREATE GLOBAL MAP
-% Merge Leader and Follower maps into unified topological graph
-if ~isempty(CorrectionData)
-    Global_Map = merge_maps(L_Map, F_Map, CorrectionData);
-else
-    Global_Map = L_Map;
-    fprintf('\nNo corrections occurred - Global map = Leader map\n');
-end
-%% PLOT
+%% PLOT RESULTS
 
-% Plot 1: Leader and Follower with UKF only (no fusion)
-figure('Name', 'Leader and Follower UKF', 'Color', 'w', 'Position', [50, 100, 900, 600]);
+figure('Name', 'Multi-Robot Trajectories', 'Color', 'w', 'Position', [50, 100, 900, 600]);
 hold on; grid on; axis equal;
 xlabel('X [m]'); ylabel('Y [m]');
-title('Leader and Follower with UKF (No Fusion)');
-plot(GT.x, GT.y, 'Color', [0.7 0.7 0.7], 'LineWidth', 4, 'DisplayName', 'Ground Truth');
+title('Distributed Multi-Robot System');
+
+% Plot Ground Truth
+plot(GT.x, GT.y, 'Color', [0.8 0.8 0.8], 'LineWidth', 4, 'DisplayName', 'Ground Truth');
 plot(Landmarks(:,1), Landmarks(:,2), 'ks', 'MarkerFaceColor', 'y', 'MarkerSize', 8, 'DisplayName', 'Landmarks');
-plot(L_hist(1,:), L_hist(2,:), 'b-', 'LineWidth', 2, 'DisplayName', 'Leader (UKF)');
-plot(F_pure_hist(1,:), F_pure_hist(2,:), 'g-', 'LineWidth', 2, 'DisplayName', 'Follower (UKF Only)');
-legend('Location', 'best');
 
-% Plot 2: Follower corrected with fusion
-figure('Name', 'Follower with Collaborative Fusion', 'Color', 'w', 'Position', [960, 100, 900, 600]);
-hold on; grid on; axis equal;
-xlabel('X [m]'); ylabel('Y [m]');
-title('Follower with Collaborative Map Fusion (CMF-GR)');
-plot(GT.x, GT.y, 'Color', [0.8 0.8 0.8], 'LineWidth', 3, 'DisplayName', 'Ground Truth');
-plot(F_hist(1,:), F_hist(2,:), 'r-', 'LineWidth', 2, 'DisplayName', 'Follower (UKF + CMF)');
-plot(L_hist(1,:), L_hist(2,:), 'b:', 'LineWidth', 1, 'DisplayName', 'Leader (Target)');
-if ~isempty(CorrectionData)
-    X_links = [CorrectionData(:,1), CorrectionData(:,3), nan(size(CorrectionData,1), 1)]';
-    Y_links = [CorrectionData(:,2), CorrectionData(:,4), nan(size(CorrectionData,1), 1)]';
-    plot(X_links(:), Y_links(:), 'g-', 'LineWidth', 1.0, 'DisplayName', 'Correction Links');
-    plot(CorrectionData(:,3), CorrectionData(:,4), 'g.', 'MarkerSize', 8, 'HandleVisibility', 'off');
-end
-legend('Location', 'best');
+for r = 1:N_ROBOTS
+    % Plot Trajectory
+    % Filter out zeros (uninitialized steps)
+    valid_idx = Robots(r).hist.state(1,:) ~= 0;
+    plot(Robots(r).hist.state(1, valid_idx), Robots(r).hist.state(2, valid_idx), ...
+        '-', 'Color', Robots(r).color, 'LineWidth', 2, 'DisplayName', Robots(r).name);
 
-
-% Plot 3: Global Map Visualization
-figure('Name', 'Global Topological Map', 'Color', 'w', 'Position', [100, 50, 1000, 700]);
-hold on; grid on; axis equal;
-xlabel('X [m]'); ylabel('Y [m]');
-title('Global Map: Unified Topological Graph (Leader + Follower)');
-
-% Plot Ground Truth for reference
-plot(GT.x, GT.y, 'Color', [0.9 0.9 0.9], 'LineWidth', 2, 'DisplayName', 'Ground Truth');
-
-% Plot all nodes colored by source
-for i = 1:Global_Map.Count
-    node = Global_Map.Nodes(i);
-
-    if strcmp(node.source, 'Leader')
-        % Leader nodes in blue
-        plot(node.pose(1), node.pose(2), 'bo', 'MarkerSize', 6, ...
-            'MarkerFaceColor', 'b', 'HandleVisibility', 'off');
-    else
-        % Follower nodes in red
-        plot(node.pose(1), node.pose(2), 'ro', 'MarkerSize', 6, ...
-            'MarkerFaceColor', 'r', 'HandleVisibility', 'off');
-    end
-end
-
-% Add representative markers for legend
-plot(nan, nan, 'bo', 'MarkerSize', 8, 'MarkerFaceColor', 'b', 'DisplayName', ...
-    sprintf('Leader Nodes (%d)', sum(strcmp({Global_Map.Nodes.source}, 'Leader'))));
-plot(nan, nan, 'ro', 'MarkerSize', 8, 'MarkerFaceColor', 'r', 'DisplayName', ...
-    sprintf('Follower Nodes (%d unique)', sum(strcmp({Global_Map.Nodes.source}, 'Follower'))));
-
-% Draw rendezvous edges
-if ~isempty(Global_Map.Edges)
-    for i = 1:length(Global_Map.Edges)
-        edge = Global_Map.Edges(i);
-
-        % Find the Follower node position
-        f_idx = edge.from_original_id;
-        if f_idx <= F_Map.Count
-            f_pos = F_Map.Nodes(f_idx).pose(1:2);
-
-            % Find the Leader node position
-            l_idx = edge.to_global_id;
-            if l_idx <= L_Map.Count
-                l_pos = L_Map.Nodes(l_idx).pose(1:2);
-
-                % Draw link
-                if i == 1
-                    plot([f_pos(1), l_pos(1)], [f_pos(2), l_pos(2)], 'g-', ...
-                        'LineWidth', 2, 'DisplayName', sprintf('Rendezvous Links (%d)', length(Global_Map.Edges)));
-                else
-                    plot([f_pos(1), l_pos(1)], [f_pos(2), l_pos(2)], 'g-', ...
-                        'LineWidth', 2, 'HandleVisibility', 'off');
-                end
-
-                % Mark rendezvous points
-                plot(f_pos(1), f_pos(2), 'go', 'MarkerSize', 10, 'LineWidth', 2, 'HandleVisibility', 'off');
-            end
-        end
+    % Plot Nodes
+    if Robots(r).Map.Count > 0
+        nodes = Robots(r).Map.Nodes(1:Robots(r).Map.Count);
+        poses = [nodes.pose];
+        plot(poses(1,:), poses(2,:), 'o', 'Color', Robots(r).color, 'MarkerFaceColor', Robots(r).color, ...
+            'MarkerSize', 4, 'HandleVisibility', 'off');
     end
 end
 
 legend('Location', 'best');
 
-% Add statistics text box
-stats_text = sprintf(['Global Map Statistics:\n' ...
-    'Total Nodes: %d\n' ...
-    'Leader: %d nodes\n' ...
-    'Follower: %d unique nodes\n' ...
-    'Rendezvous Links: %d'], ...
-    Global_Map.Count, ...
-    sum(strcmp({Global_Map.Nodes.source}, 'Leader')), ...
-    sum(strcmp({Global_Map.Nodes.source}, 'Follower')), ...
-    length(Global_Map.Edges));
-
-annotation('textbox', [0.15, 0.75, 0.2, 0.15], 'String', stats_text, ...
-    'FitBoxToText', 'on', 'BackgroundColor', 'white', ...
-    'EdgeColor', 'black', 'FontSize', 10);
-
-% Plot 4: NEES over time
-figure('Name', 'NEES over Time', 'Color', 'w', 'Position', [50, 750, 900, 400]);
+% NEES Plot
+figure('Name', 'NEES', 'Color', 'w', 'Position', [50, 750, 900, 400]);
 hold on; grid on;
-plot(1:N, L_NEES_hist, 'b-', 'LineWidth', 1.5, 'DisplayName', 'Leader NEES');
-plot(1:N, F_NEES_hist, 'r-', 'LineWidth', 1.5, 'DisplayName', 'Follower NEES');
-xlabel('Step k');
+for r = 1:N_ROBOTS
+    plot(1:N_STEPS, Robots(r).hist.nees, '-', 'Color', Robots(r).color, 'DisplayName', [Robots(r).name ' NEES']);
+end
+xlabel('Global Step k');
 ylabel('NEES');
 title('NEES Evolution');
 legend('Location', 'best');
 
 
-function [Map, added] = update_map_rt(Map, pose, view_id, Params)
+function [Map, added] = update_map_rt(Map, pose, view_id, Params, source_name)
 added = false;
 if Map.Count == 0
     Map.Count = 1; Map.Nodes(1).id = 1; Map.Nodes(1).pose = pose;
-    Map.Nodes(1).view_id = view_id; Map.last_node_pose = pose; added = true; return;
+    Map.Nodes(1).view_id = view_id; Map.Nodes(1).source = source_name;
+    Map.last_node_pose = pose; added = true; return;
 end
 dist = norm(pose(1:2) - Map.last_node_pose(1:2));
 dth = abs(angdiff(Map.last_node_pose(3), pose(3)));
 if dist > Params.dist_thresh || dth > Params.angle_thresh
     Map.Count = Map.Count + 1; idx = Map.Count;
     Map.Nodes(idx).id = idx; Map.Nodes(idx).pose = pose;
-    Map.Nodes(idx).view_id = view_id; Map.last_node_pose = pose; added = true;
+    Map.Nodes(idx).view_id = view_id; Map.Nodes(idx).source = source_name;
+    Map.last_node_pose = pose; added = true;
 end
 end
 

@@ -1,80 +1,107 @@
-function [F_Map, F_state, F_P] = align_and_relax_map(F_Map, F_state, F_P, target_pose, influence_radius, L_P)
+function [F_Map, F_state, F_P] = align_and_relax_map(F_Map, F_state, F_P, target_pose, influence_radius, target_P)
 % ALIGN_AND_RELAX_MAP - CMF-GR: Collaborative Map Fusion with Graph Relaxation
 %
-% This function implements the hierarchical fusion approach with TOPOLOGICAL relaxation:
-% 1. Calculates rigid transformation T between Follower and Leader poses
-% 2. Applies transformation to Follower state
-% 3. Propagates correction BACKWARD through graph topology (not spatial distance)
+% Implements Covariance Intersection (CI) for fusion and Topological Relaxation.
 %
 % Inputs:
-%   F_Map           - Follower map structure with .Nodes and .Count
+%   F_Map           - Follower map structure
 %   F_state         - Current Follower state [x; y; theta] (3x1)
 %   F_P             - Follower covariance matrix (3x3)
-%   target_pose     - Leader pose to align to [x; y; theta] (3x1)
-%   influence_radius - Radius for graph relaxation (meters, converted to hops)
-%   L_P             - Leader covariance matrix (3x3)
-%
-% Outputs:
-%   F_Map   - Updated Follower map
-%   F_state - Corrected Follower state
-%   F_P     - Updated Follower covariance
+%   target_pose     - Target pose to align to [x; y; theta] (3x1)
+%   influence_radius - Radius for graph relaxation (meters)
+%   target_P        - Target covariance matrix (3x3)
 
-% --- STEP 4: Calcola errore relativo Pose_B vs Pose_A_matched ---
-% Calculate the transform that maps F_state to target_pose
-dth = angdiff(F_state(3), target_pose(3));
-translation = target_pose(1:2) - F_state(1:2);
+% 1. Covariance Intersection (CI)
+% Calculate optimal omega using trace heuristic
+% omega = trace(P_B) / (trace(P_A) + trace(P_B))
+% Here A = Follower, B = Target
 
-% --- STEP 5: Calcola T_alignment ---
-% The pivot point is the current F_state (rendezvous point)
-pivot = F_state(1:2);
+tr_F = trace(F_P);
+tr_T = trace(target_P);
 
-% --- STEP 6: Esegui CMF_Graph_Relaxation (Map_B, Map_A, T_alignment) ---
-% TOPOLOGICAL RELAXATION (Paper Eq. 10):
-% Instead of using spatial distance, propagate correction backward through
-% the graph structure (temporal/topological order).
-% Weight decays with graph distance (hop count), not spatial distance.
-%
-% This is more robust in complex environments (e.g., U-turns, overlapping loops)
-% where nodes can be spatially close but topologically far apart.
+% Avoid division by zero
+if (tr_F + tr_T) < 1e-9
+    omega = 0.5;
+else
+    omega = tr_T / (tr_F + tr_T);
+end
 
-% Update Current State (Weight = 1 at rendezvous)
-F_state(3) = angdiff(0, F_state(3) + dth);
-F_state(1:2) = F_state(1:2) + translation;
+% Compute Fused Covariance
+% P_fused = inv( omega * inv(F_P) + (1-omega) * inv(target_P) )
+try
+    inv_F = inv(F_P);
+    inv_T = inv(target_P);
+    inv_fused = omega * inv_F + (1 - omega) * inv_T;
+    P_fused = inv(inv_fused);
 
-% Update Map Nodes with TOPOLOGICAL Graph Relaxation
+    % Compute Fused State
+    % x_fused = P_fused * ( omega * inv(F_P) * x_F + (1-omega) * inv(target_P) * x_T )
+
+    % Handle angle wrapping for theta
+    % We fuse [x, y] normally. For theta, we fuse deviations from F_state(3).
+
+    % State vectors
+    x_F = F_state;
+    x_T = target_pose;
+
+    % Adjust x_T(3) to be close to x_F(3) to avoid wrap-around issues during weighted average
+    x_T(3) = x_F(3) + angdiff(x_F(3), x_T(3));
+
+    term_F = omega * inv_F * x_F;
+    term_T = (1 - omega) * inv_T * x_T;
+
+    x_fused = P_fused * (term_F + term_T);
+    x_fused(3) = angdiff(0, x_fused(3)); % Wrap result
+
+catch
+    % Fallback if singular
+    warning('CI Inversion failed. Using simple average.');
+    P_fused = (F_P + target_P) / 2;
+    x_fused = F_state;
+    x_fused(1:2) = (F_state(1:2) + target_pose(1:2)) / 2;
+    x_fused(3) = F_state(3) + 0.5 * angdiff(F_state(3), target_pose(3));
+end
+
+% 2. Calculate Correction Vector
+correction = x_fused - F_state;
+correction(3) = angdiff(F_state(3), x_fused(3));
+
+dth = correction(3);
+translation = correction(1:2);
+
+% 3. Apply Correction to Current State
+F_state = x_fused;
+F_P = P_fused* 1.1;
+
+% 4. Topological Graph Relaxation
+% Propagate the correction backward
+
 if F_Map.Count > 0
-    % Convert influence_radius to topological hops
-    % Approximate: assume ~2m per node on average
-    influence_hops = ceil(influence_radius / 2.0);
-    influence_hops = min(influence_hops, F_Map.Count - 1);  % Cap at map size
+    pivot = F_state(1:2) - translation; % The original position before correction
 
-    % Current node index (most recent, at rendezvous)
+    % Convert influence_radius to topological hops (approx 2m/node)
+    influence_hops = ceil(influence_radius / 2.0);
+    influence_hops = min(influence_hops, F_Map.Count - 1);
+
     current_idx = F_Map.Count;
 
-    % Propagate correction BACKWARD through graph topology
     for hop = 1:influence_hops
-        % Index of node to correct (going backward in time)
         idx = current_idx - hop;
-
-        if idx < 1
-            break;  % Reached beginning of map
-        end
+        if idx < 1, break; end
 
         node_pose = F_Map.Nodes(idx).pose;
 
-        % Weight Function: Linear decay with TOPOLOGICAL distance (hop count)
-        % w = 1.0 at rendezvous (hop=0), w = 0.0 at influence_hops
+        % Weight: Linear decay
         w = 1.0 - (hop / influence_hops);
 
-        % Apply Weighted Correction
-        % 1. Rotate around pivot by w * dth
+        % Apply weighted correction
+        % Rotate around pivot
         dth_w = w * dth;
         R_w = [cos(dth_w), -sin(dth_w); sin(dth_w), cos(dth_w)];
 
         rel_pos = node_pose(1:2) - pivot;
         rot_pos = R_w * rel_pos;
 
-        % 2. Translate by w * translation
         trans_w = w * translation;
 
         new_pos = pivot + rot_pos + trans_w;
@@ -83,55 +110,9 @@ if F_Map.Count > 0
         F_Map.Nodes(idx).pose = [new_pos; new_th];
     end
 
-    % Update last_node_pose (most recent node)
+    % Update last_node_pose
     F_Map.last_node_pose = F_Map.Nodes(F_Map.Count).pose;
 end
-
-% Update Covariance using Covariance Intersection
-% This method handles unknown correlations between Leader and Follower
-% Reference: DRP_Notes.pdf Cap. 15 - Distributed Data Fusion
-%
-% The old method (F_P = F_P * 0.5) was mathematically invalid:
-% - Artificially reduced uncertainty
-% - Caused filter inconsistency (NEES >> expected value)
-% - Violated uncertainty propagation principles
-%
-% Covariance Intersection provides conservative, consistent fusion:
-
-% Mixing parameter (0 < omega < 1)
-% omega closer to 1 = trust Follower more
-% omega closer to 0 = trust Leader more
-% omega = 0.5 = equal weighting (conservative)
-omega = 0.5;
-
-% Estimate of Leader's uncertainty at rendezvous
-% This should ideally be received from Leader, but we approximate it
-% based on typical UKF performance
-%P_Leader_est = diag([5^2, 5^2, 0.1^2]);  % [x_var, y_var, theta_var]
-
-% Covariance Intersection formula:
-% P_fused^-1 = omega * P_Follower^-1 + (1 - omega) * P_Leader^-1
-try
-    P_F_inv = inv(F_P);
-    P_L_inv = inv(L_P);
-    P_fused_inv = omega * P_F_inv + (1 - omega) * P_L_inv;
-    F_P = inv(P_fused_inv);
-catch
-    % If inversion fails (singular matrix), fall back to addition
-    warning('Covariance inversion failed, using conservative addition');
-    F_P = F_P + L_P;
-end
-
-% Add uncertainty from visual matching/sequence matching
-% This represents the imperfect nature of the rendezvous detection
-R_match = diag([2^2, 2^2, 0.05^2]);  % Matching uncertainty
-F_P = F_P + R_match;
-
-% Ensure symmetry and positive definiteness
-F_P = (F_P + F_P') / 2;
-[U, S] = eig(F_P);
-S = max(S, 1e-6);  % Ensure positive eigenvalues
-F_P = U * S * U';
 
 end
 
